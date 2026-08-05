@@ -1,0 +1,39 @@
+# ── Données volumineuses (non versionnées) ─────────────────────────────────────
+documents/               # PDFs sources
+chunks_output_v2/        # chunks JSON générés (reconstruits par CHUNK.py.py)
+embeddings_v2/           # index FAISS, BM25, vecteurs (reconstruits par embedding_v2.py)
+
+# ── Modèles ────────────────────────────────────────────────────────────────────
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# ── Manifest (versionné séparément si souhaité) ────────────────────────────────
+manifest.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Environnements virtuels ───────────────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+
+# ── Fichiers temporaires ──────────────────────────────────────────────────────
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
