@@ -74,56 +74,6 @@ rag_3/
 
 ---
 
-## Installation
-
-### 1. Cloner le repo
-```bash
-git clone https://github.com/benpmac/rag_3.git
-cd rag_3
-```
-
-### 2. Créer et activer l'environnement virtuel
-```bash
-python3 -m venv ~/airflow-env
-source ~/airflow-env/bin/activate
-```
-
-### 3. Installer les dépendances
-```bash
-pip install apache-airflow faiss-cpu rank-bm25 FlagEmbedding \
-            pymupdf pdfplumber opendataloader-pdf requests numpy
-```
-
-### 4. Télécharger les modèles
-```bash
-# BGE-M3 (~2.3 Go)
-hf download BAAI/bge-m3 --local-dir ~/models/bge-m3
-
-# BGE Reranker (~2.3 Go)
-hf download BAAI/bge-reranker-v2-m3 --local-dir ~/models/bge-reranker-v2-m3
-```
-
-### 5. Configurer Airflow
-```bash
-export AIRFLOW_HOME=~/airflow
-airflow db init
-
-# Configurer le SMTP dans ~/airflow/airflow.cfg (section [smtp])
-# pour recevoir les notifications par email
-
-# Créer le lien symbolique pour le DAG
-ln -s ~/rag_3/rag3_ingestion.py ~/airflow/dags/rag3_ingestion.py
-```
-
-### 6. Démarrer Airflow
-```bash
-source ~/airflow-env/bin/activate
-airflow scheduler &
-airflow webserver --port 8080 &
-```
-
----
-
 ## Usage
 
 ### Indexer de nouveaux PDFs
@@ -135,28 +85,6 @@ cp mon_rapport.pdf ~/rag_3/documents/
 
 Le DAG Airflow détecte automatiquement le nouveau fichier toutes les **30 minutes** et lance le pipeline complet.
 
-Pour déclencher manuellement :
-```bash
-airflow dags trigger rag3_anstat_ingestion
-```
-
-Ou via l'interface web : `http://localhost:8080`
-
-### Interroger le système
-```bash
-source ~/airflow-env/bin/activate
-cd ~/rag_3
-python system.py.py
-```
-
-Exemples de questions :
-```
-> Quel est le taux de pauvreté en Côte d'Ivoire en 2021 ?
-> Compare les conditions de vie entre milieu rural et urbain.
-> Quels sont les indicateurs de santé de l'EDS 2021 ?
-```
-
----
 
 ## Pipeline Airflow détaillé
 
@@ -198,22 +126,5 @@ embeddings_v2/
 |---|---|---|
 | BAAI/bge-m3 | Embedding des chunks et des questions | 1024 |
 | BAAI/bge-reranker-v2-m3 | Reranking cross-encoder (top 5) | — |
-| Qwen/Qwen2.5-7B-Instruct-AWQ | Génération de la réponse finale | — |
 
----
 
-## Documents indexés
-
-Rapports statistiques officiels de l'ANSTAT-CI :
-- EHCVM 2021 — Conditions de vie des ménages
-- EDS 2021 — Enquête Démographique et de Santé
-- ENE 2019 — Enquête Nationale sur l'Emploi
-- IPS Éducation 2022 / IPS Santé 2021
-- RGPH — Recensement Général de la Population
-- Et d'autres rapports ANSTAT-CI...
-
----
-
-## Contact
-
-Projet développé dans le cadre de l'ANSTAT-CI.
