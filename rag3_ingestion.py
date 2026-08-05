@@ -82,23 +82,60 @@ EMAIL_DEST     = [
 
 # ── Callbacks email ────────────────────────────────────────────────────────────
 
+def _lire_metadata() -> dict:
+    """Lit embeddings_v2/metadata.json pour enrichir les emails."""
+    meta_file = RAG3_DIR / "embeddings_v2" / "metadata.json"
+    if meta_file.exists():
+        with open(meta_file, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
 def _envoyer_email_succes(context):
     task_id  = context["task_instance"].task_id
     run_id   = context["run_id"]
     duration = context["task_instance"].duration
-    dur_str  = f"{duration:.0f}s" if duration else "?"
+    dur_str  = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
+
+    # Récupère le résultat retourné par la tâche (XCom)
+    xcom_result = context["task_instance"].xcom_pull(task_ids=task_id) or ""
+
+    # Bloc stats spécifique à construire_index
+    stats_html = ""
+    if task_id == "construire_index":
+        meta = _lire_metadata()
+        if meta:
+            stats = meta.get("chunk_stats", {})
+            stats_html = f"""
+            <h4>📊 État de la base vectorielle</h4>
+            <table border="1" cellpadding="6" cellspacing="0">
+              <tr><td><b>Chunks totaux</b></td><td>{meta.get('total_chunks', '?'):,}</td></tr>
+              <tr><td><b>Dont tableaux</b></td><td>{stats.get('tables_count', '?'):,}</td></tr>
+              <tr><td><b>Avec contexte LLM</b></td><td>{stats.get('with_context', '?'):,}</td></tr>
+              <tr><td><b>Modèle embedding</b></td><td>BGE-M3</td></tr>
+            </table>
+            """
+
+    # Bloc PDFs pour chunker_pdfs
+    pdfs_html = ""
+    if task_id == "chunker_pdfs" and isinstance(xcom_result, list):
+        pdfs_list = "".join(f"<li>{p}</li>" for p in xcom_result) or "<li>Aucun</li>"
+        pdfs_html = f"<h4>📄 PDFs traités ({len(xcom_result)})</h4><ul>{pdfs_list}</ul>"
+
     send_email(
         to      = EMAIL_DEST,
-        subject = f"[RAG3 ✅] {task_id} terminé",
+        subject = f"[RAG3 ✅] {task_id} terminé ({dur_str})",
         html_content = f"""
-        <h3>✅ Tâche réussie — RAG3 ANSTAT</h3>
-        <table>
+        <h3>✅ Tâche réussie — RAG3 ANSTAT-CI</h3>
+        <table border="1" cellpadding="6" cellspacing="0">
           <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
-          <tr><td><b>Run</b></td><td>{run_id}</td></tr>
           <tr><td><b>Durée</b></td><td>{dur_str}</td></tr>
           <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+          <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
         </table>
-        <p>Logs : <a href="http://localhost:8080">Interface Airflow</a></p>
+        {pdfs_html}
+        {stats_html}
+        <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
         """,
     )
 
@@ -107,18 +144,21 @@ def _envoyer_email_echec(context):
     task_id   = context["task_instance"].task_id
     run_id    = context["run_id"]
     exception = context.get("exception", "inconnue")
+    duration  = context["task_instance"].duration
+    dur_str   = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
     send_email(
         to      = EMAIL_DEST,
         subject = f"[RAG3 ❌] {task_id} a échoué",
         html_content = f"""
-        <h3>❌ Échec — RAG3 ANSTAT</h3>
-        <table>
+        <h3>❌ Échec — RAG3 ANSTAT-CI</h3>
+        <table border="1" cellpadding="6" cellspacing="0">
           <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
-          <tr><td><b>Run</b></td><td>{run_id}</td></tr>
-          <tr><td><b>Erreur</b></td><td>{exception}</td></tr>
+          <tr><td><b>Erreur</b></td><td style="color:red">{exception}</td></tr>
+          <tr><td><b>Durée avant échec</b></td><td>{dur_str}</td></tr>
           <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+          <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
         </table>
-        <p>Logs : <a href="http://localhost:8080">Interface Airflow</a></p>
+        <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
         """,
     )
 
