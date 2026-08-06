@@ -76,7 +76,7 @@ USE_LLM        = True   # Mettre False si vLLM inaccessible
 # Notifications email
 EMAIL_DEST     = [
     "pierremariecdricbenson@gmail.com",
-    "j.migone@stat.plan.gouv.ci",
+    "franckmigone@gmail.com"
 ]
 
 
