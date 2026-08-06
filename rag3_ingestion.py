@@ -59,6 +59,7 @@ from pathlib import Path
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
+from airflow.models import Variable
 from airflow.utils.email import send_email
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -74,11 +75,8 @@ EMBED_SCRIPT   = RAG3_DIR / "embedding_v2.py"
 VLLM_URL       = "http://192.168.1.230:30179/v1/chat/completions"
 USE_LLM        = True   # Mettre False si vLLM inaccessible
 
-# Notifications email
-EMAIL_DEST     = [
-    "pierremariecdricbenson@gmail.com",
-    "franckmigone@gmail.com"
-]
+# Notifications email (géré via Airflow UI : Admin > Variables > rag3_email_dest)
+EMAIL_DEST = Variable.get("rag3_email_dest", deserialize_json=True, default_var=[])
 
 
 # ── Callbacks email ────────────────────────────────────────────────────────────
