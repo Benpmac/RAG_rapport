@@ -38,13 +38,11 @@ FONCTIONS UTILITAIRES
 PIPELINE
   detecter_changements
           │
-  y_a_t_il_du_travail   ← court-circuit si rien à faire
+  y_a_t_il_du_travail   ← court-circuit si rien a faire
           │
-     ┌────┴────┐
-     │         │
-  supprimer  chunker_pdfs
-     │         │
-     └────┬────┘
+  supprimer_anciens_chunks
+          │
+  chunker_pdfs
           │
   construire_index      ← embedding_v2.build() + maj manifest
 """
@@ -444,22 +442,22 @@ def rag3_ingestion():
     #         │ (XComArg)
     #  y_a_t_il_du_travail    ← short-circuit si aucun changement
     #         │
-    #    ┌────┴────┐
-    #    │         │
-    # supprimer  chunker_pdfs
-    #    │         │ (XComArg pdfs_traites)
-    #    └────┬────┘
+    #  supprimer_anciens_chunks
+    #         │
+    #  chunker_pdfs           (XComArg pdfs_traites)
     #         │
     #  construire_index
+    #
+    # La suppression est strictement anterieure au chunking pour eviter
+    # qu'un chunking en cours sur un PDF modifie soit ecrase par la suppression.
 
     changements  = detecter_changements()
     go           = y_a_t_il_du_travail(changements)
     suppression  = supprimer_anciens_chunks(changements)
     pdfs_traites = chunker_pdfs(changements)
-    indexation   = construire_index(pdfs_traites, changements)
+    indexation   = construire_index(pdfs_traites, changements)  # noqa: F841
 
-    go >> [suppression, pdfs_traites]
-    suppression >> indexation
+    go >> suppression >> pdfs_traites
 
 
 rag3_ingestion()
