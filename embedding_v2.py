@@ -43,6 +43,7 @@ import pickle
 import re
 import time
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 import faiss
@@ -138,10 +139,13 @@ def charger_tous_les_chunks() -> tuple[dict, dict]:
             meta = chunk.get("metadata", {})
             text = chunk.get("text", "")
 
+            context_desc = meta.get("context_description", "")
+            enriched     = f"{context_desc} {text}".strip() if context_desc else text
+
             chunk_map[cid] = {
                 "content":        text,
-                "enriched_text":  text,
-                "context_desc":   meta.get("context_description", ""),
+                "enriched_text":  enriched,
+                "context_desc":   context_desc,
                 "document_name":  meta.get("document_name",  doc_meta.get("document_name",  "")),
                 "document_title": meta.get("document_title", doc_meta.get("document_title", "")),
                 "source_url":     meta.get("source_url",     doc_meta.get("document_url",   "")),
@@ -230,13 +234,21 @@ def encoder_nouveaux_chunks(
         print("   Aucun nouveau chunk à encoder")
         return [], np.empty((0, 1024), dtype=np.float32)
 
-    print(f"   Encodage de {len(a_encoder)} chunks...")
     ids   = [cid  for cid, _    in a_encoder]
     texts = [text for _,   text in a_encoder]
+    n     = len(texts)
+    print(f"   Encodage de {n} chunks (par lots de {BATCH_SIZE})...")
 
-    t0   = time.time()
-    vecs = encoder(model, model_type, texts)
-    print(f"   Encodés en {time.time() - t0:.1f}s")
+    t0       = time.time()
+    all_vecs = []
+    for i in range(0, n, BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        all_vecs.append(encoder(model, model_type, batch))
+        done = min(i + BATCH_SIZE, n)
+        print(f"   {done}/{n} ({done * 100 // n}%)", end="\r", flush=True)
+
+    vecs = np.vstack(all_vecs)
+    print(f"\n   Encodés en {time.time() - t0:.1f}s")
     return ids, vecs
 
 
@@ -297,6 +309,7 @@ def sauvegarder(
     metadata = {
         "total_chunks":    len(chunk_ids),
         "embedding_model": EMBEDDING_MODEL,
+        "last_updated":    datetime.now(timezone.utc).isoformat(),
         "chunk_stats": {
             "tables_count": tables_count,
             "with_context": with_context,
@@ -338,14 +351,17 @@ def build(incremental: bool = True):
         existing_ids = [cid for _, cid in valid_existing]
         existing_vecs = existing_vecs[keep_idx] if keep_idx else np.empty((0, 1024), dtype=np.float32)
 
-    # 4. Encodage des nouveaux chunks
-    print("\n[3/5] Chargement du modèle BGE-M3...")
-    model, model_type = charger_modele()
+    # 3. Encodage des nouveaux chunks (modèle chargé seulement si nécessaire)
+    print("\n[3/5] Encodage des nouveaux chunks...")
+    a_encoder = [cid for cid in chunk_map if cid not in set(existing_ids)]
+    if a_encoder:
+        model, model_type = charger_modele()
+        new_ids, new_vecs = encoder_nouveaux_chunks(model, model_type, chunk_map, existing_ids)
+    else:
+        print("   Aucun nouveau chunk, modèle BGE-M3 non chargé.")
+        new_ids, new_vecs = [], np.empty((0, 1024), dtype=np.float32)
 
-    print("\n[4/5] Encodage des nouveaux chunks...")
-    new_ids, new_vecs = encoder_nouveaux_chunks(model, model_type, chunk_map, existing_ids)
-
-    # 5. Fusion
+    # 4. Fusion
     all_ids  = existing_ids + new_ids
     all_vecs = (
         np.vstack([existing_vecs, new_vecs])
@@ -354,15 +370,16 @@ def build(incremental: bool = True):
     )
 
     # Réordonner selon chunk_map pour cohérence
-    id_to_idx = {cid: i for i, cid in enumerate(all_ids)}
+    id_to_idx    = {cid: i for i, cid in enumerate(all_ids)}
     ordered_ids  = list(chunk_map.keys())
     ordered_vecs = np.stack([all_vecs[id_to_idx[cid]] for cid in ordered_ids])
 
-    # 5. Rebuild FAISS + BM25
-    print("\n[5/5] Construction des index...")
+    # 5. Construction des index FAISS + BM25
+    print("\n[4/5] Construction des index...")
     faiss_index = construire_faiss(ordered_ids, ordered_vecs)
     bm25_index  = construire_bm25(ordered_ids, chunk_map)
 
+    print("\n[5/5] Sauvegarde...")
     sauvegarder(ordered_ids, ordered_vecs, chunk_map, graph_meta,
                 faiss_index, bm25_index)
 

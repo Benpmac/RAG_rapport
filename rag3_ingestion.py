@@ -53,6 +53,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,75 +93,79 @@ def _lire_metadata() -> dict:
 
 
 def _envoyer_email_succes(context):
-    task_id  = context["task_instance"].task_id
-    run_id   = context["run_id"]
-    duration = context["task_instance"].duration
-    dur_str  = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
+    try:
+        task_id  = context["task_instance"].task_id
+        run_id   = context["run_id"]
+        duration = context["task_instance"].duration
+        dur_str  = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
 
-    # Récupère le résultat retourné par la tâche (XCom)
-    xcom_result = context["task_instance"].xcom_pull(task_ids=task_id) or ""
+        xcom_result = context["task_instance"].xcom_pull(task_ids=task_id) or ""
 
-    # Bloc stats spécifique à construire_index
-    stats_html = ""
-    if task_id == "construire_index":
-        meta = _lire_metadata()
-        if meta:
-            stats = meta.get("chunk_stats", {})
-            stats_html = f"""
-            <h4>📊 État de la base vectorielle</h4>
+        stats_html = ""
+        if task_id == "construire_index":
+            meta = _lire_metadata()
+            if meta:
+                stats = meta.get("chunk_stats", {})
+                stats_html = f"""
+                <h4>📊 État de la base vectorielle</h4>
+                <table border="1" cellpadding="6" cellspacing="0">
+                  <tr><td><b>Chunks totaux</b></td><td>{meta.get('total_chunks', '?'):,}</td></tr>
+                  <tr><td><b>Dont tableaux</b></td><td>{stats.get('tables_count', '?'):,}</td></tr>
+                  <tr><td><b>Avec contexte LLM</b></td><td>{stats.get('with_context', '?'):,}</td></tr>
+                  <tr><td><b>Date indexation</b></td><td>{meta.get('last_updated', '?')}</td></tr>
+                  <tr><td><b>Modèle embedding</b></td><td>BGE-M3</td></tr>
+                </table>
+                """
+
+        pdfs_html = ""
+        if task_id == "chunker_pdfs" and isinstance(xcom_result, list):
+            pdfs_list = "".join(f"<li>{p}</li>" for p in xcom_result) or "<li>Aucun</li>"
+            pdfs_html = f"<h4>📄 PDFs traités ({len(xcom_result)})</h4><ul>{pdfs_list}</ul>"
+
+        send_email(
+            to      = EMAIL_DEST,
+            subject = f"[RAG3 ✅] {task_id} terminé ({dur_str})",
+            html_content = f"""
+            <h3>✅ Tâche réussie — RAG3 ANSTAT-CI</h3>
             <table border="1" cellpadding="6" cellspacing="0">
-              <tr><td><b>Chunks totaux</b></td><td>{meta.get('total_chunks', '?'):,}</td></tr>
-              <tr><td><b>Dont tableaux</b></td><td>{stats.get('tables_count', '?'):,}</td></tr>
-              <tr><td><b>Avec contexte LLM</b></td><td>{stats.get('with_context', '?'):,}</td></tr>
-              <tr><td><b>Modèle embedding</b></td><td>BGE-M3</td></tr>
+              <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
+              <tr><td><b>Durée</b></td><td>{dur_str}</td></tr>
+              <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+              <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
             </table>
-            """
-
-    # Bloc PDFs pour chunker_pdfs
-    pdfs_html = ""
-    if task_id == "chunker_pdfs" and isinstance(xcom_result, list):
-        pdfs_list = "".join(f"<li>{p}</li>" for p in xcom_result) or "<li>Aucun</li>"
-        pdfs_html = f"<h4>📄 PDFs traités ({len(xcom_result)})</h4><ul>{pdfs_list}</ul>"
-
-    send_email(
-        to      = EMAIL_DEST,
-        subject = f"[RAG3 ✅] {task_id} terminé ({dur_str})",
-        html_content = f"""
-        <h3>✅ Tâche réussie — RAG3 ANSTAT-CI</h3>
-        <table border="1" cellpadding="6" cellspacing="0">
-          <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
-          <tr><td><b>Durée</b></td><td>{dur_str}</td></tr>
-          <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
-          <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
-        </table>
-        {pdfs_html}
-        {stats_html}
-        <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
-        """,
-    )
+            {pdfs_html}
+            {stats_html}
+            <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
+            """,
+        )
+    except Exception as exc:
+        print(f"[email] Impossible d'envoyer l'email de succès : {exc}")
 
 
 def _envoyer_email_echec(context):
-    task_id   = context["task_instance"].task_id
-    run_id    = context["run_id"]
-    exception = context.get("exception", "inconnue")
-    duration  = context["task_instance"].duration
-    dur_str   = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
-    send_email(
-        to      = EMAIL_DEST,
-        subject = f"[RAG3 ❌] {task_id} a échoué",
-        html_content = f"""
-        <h3>❌ Échec — RAG3 ANSTAT-CI</h3>
-        <table border="1" cellpadding="6" cellspacing="0">
-          <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
-          <tr><td><b>Erreur</b></td><td style="color:red">{exception}</td></tr>
-          <tr><td><b>Durée avant échec</b></td><td>{dur_str}</td></tr>
-          <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
-          <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
-        </table>
-        <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
-        """,
-    )
+    try:
+        task_id   = context["task_instance"].task_id
+        run_id    = context["run_id"]
+        exception = context.get("exception", "inconnue")
+        duration  = context["task_instance"].duration
+        dur_str   = f"{int(duration // 60)}min {int(duration % 60)}s" if duration else "?"
+        send_email(
+            to      = EMAIL_DEST,
+            subject = f"[RAG3 ❌] {task_id} a échoué",
+            html_content = f"""
+            <h3>❌ Échec — RAG3 ANSTAT-CI</h3>
+            <table border="1" cellpadding="6" cellspacing="0">
+              <tr><td><b>Tâche</b></td><td>{task_id}</td></tr>
+              <tr><td><b>Erreur</b></td><td style="color:red">{exception}</td></tr>
+              <tr><td><b>Durée avant échec</b></td><td>{dur_str}</td></tr>
+              <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+              <tr><td><b>Run ID</b></td><td>{run_id}</td></tr>
+            </table>
+            <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
+            """,
+        )
+    except Exception as exc:
+        print(f"[email] Impossible d'envoyer l'email d'échec : {exc}")
 
 
 # ── Utilitaires manifest ───────────────────────────────────────────────────────
@@ -200,6 +205,18 @@ def _sauvegarder_manifest(manifest: dict) -> None:
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
+# ── Utilitaires vLLM ──────────────────────────────────────────────────────────
+
+def _verifier_vllm(url: str, timeout: int = 5) -> bool:
+    """Vérifie que le serveur vLLM répond sur /health."""
+    health_url = url.replace("/v1/chat/completions", "/health")
+    try:
+        with urllib.request.urlopen(health_url, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 # ── DAG ───────────────────────────────────────────────────────────────────────
@@ -303,7 +320,7 @@ def rag3_ingestion():
         print(f"{supprime_count} fichier(s) chunk supprimé(s). "
               f"Manifest mis à jour : {len(changements['supprimes'])} retrait(s).")
 
-    @task(execution_timeout=None, on_success_callback=_envoyer_email_succes)
+    @task(execution_timeout=None, retries=1, on_success_callback=_envoyer_email_succes)
     def chunker_pdfs(changements: dict) -> list:
         """
         Appelle RaptorRAGPipeline.process_document() sur chaque PDF
@@ -316,14 +333,38 @@ def rag3_ingestion():
             print("Aucun PDF à chunker.")
             return []
 
+        # Email de démarrage
+        try:
+            send_email(
+                to=EMAIL_DEST,
+                subject=f"[RAG3 🚀] Pipeline démarré — {len(pdfs_a_chunker)} PDF(s)",
+                html_content=f"""
+                <h3>🚀 Démarrage — RAG3 ANSTAT-CI</h3>
+                <table border="1" cellpadding="6" cellspacing="0">
+                  <tr><td><b>PDFs à traiter</b></td><td>{len(pdfs_a_chunker)}</td></tr>
+                  <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+                </table>
+                <ul>{"".join(f"<li>{p}</li>" for p in pdfs_a_chunker)}</ul>
+                <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
+                """,
+            )
+        except Exception as exc:
+            print(f"[email] Email de démarrage non envoyé : {exc}")
+
         if not CHUNK_SCRIPT.exists():
             raise FileNotFoundError(
                 f"Script CHUNK.py.py introuvable : {CHUNK_SCRIPT}\n"
-                "Vérifiez que le disque Windows est monté dans WSL2 (/mnt/c/)."
+                "Vérifiez que CHUNK.py.py est bien présent dans ~/rag_3/."
             )
 
+        # Vérification accessibilité vLLM
+        use_llm = USE_LLM
+        if USE_LLM and not _verifier_vllm(VLLM_URL):
+            print("⚠️  vLLM inaccessible — chunking sans enrichissement LLM (use_llm_context=False)")
+            use_llm = False
+
         # Import dynamique — le nom de fichier contient des points
-        spec     = importlib.util.spec_from_file_location("chunk_pipeline", str(CHUNK_SCRIPT))
+        spec      = importlib.util.spec_from_file_location("chunk_pipeline", str(CHUNK_SCRIPT))
         chunk_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(chunk_mod)
 
@@ -333,11 +374,11 @@ def rag3_ingestion():
         config = PipelineConfig(
             documents_dir   = DOCUMENTS_DIR,
             output_dir      = CHUNKS_DIR,
-            use_llm_context = USE_LLM,
+            use_llm_context = use_llm,
             vllm_url        = VLLM_URL,
-            use_camelot     = False,  # dépendances complexes non installées
+            use_camelot     = False,
             use_pdfplumber  = True,
-            max_workers     = 1,      # séquentiel pour préserver la RAM
+            max_workers     = 1,
         )
 
         pipeline = RaptorRAGPipeline(config)
@@ -362,7 +403,7 @@ def rag3_ingestion():
         print(f"\n{len(traites)}/{len(pdfs_a_chunker)} PDF(s) chunkés avec succès.")
         return traites
 
-    @task(execution_timeout=None, on_success_callback=_envoyer_email_succes)
+    @task(execution_timeout=None, retries=1, on_success_callback=_envoyer_email_succes)
     def construire_index(pdfs_traites: list, changements: dict) -> str:
         """
         1. Appelle embedding_v2.build(incremental=True) :
