@@ -52,7 +52,7 @@ import importlib.util
 import json
 import os
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from airflow.decorators import dag, task
@@ -70,14 +70,24 @@ CHUNK_SCRIPT   = RAG3_DIR / "CHUNK.py.py"
 EMBED_SCRIPT   = RAG3_DIR / "embedding_v2.py"
 
 # LLM pour l'enrichissement contextuel RAPTOR (optionnel)
-VLLM_URL       = "http://192.168.1.230:30179/v1/chat/completions"
-USE_LLM        = True   # Mettre False si vLLM inaccessible
+# Gere via Airflow UI : Admin > Variables > rag3_vllm_url
+# Laisser vide pour desactiver l'enrichissement LLM.
+VLLM_URL = Variable.get("rag3_vllm_url", default_var="")
+USE_LLM  = bool(VLLM_URL)
 
-# Notifications email (géré via Airflow UI : Admin > Variables > rag3_email_dest)
+# Notifications email (gere via Airflow UI : Admin > Variables > rag3_email_dest)
+# Format JSON : ["adresse1@example.com", "adresse2@example.com"]
 EMAIL_DEST = Variable.get("rag3_email_dest", deserialize_json=True, default_var=[])
 
 
 # ── Callbacks email ────────────────────────────────────────────────────────────
+
+def _fmt_nombre(valeur) -> str:
+    """Formate un entier avec separateur de milliers, tolere les valeurs absentes."""
+    if isinstance(valeur, (int, float)):
+        return f"{valeur:,}"
+    return "?"
+
 
 def _lire_metadata() -> dict:
     """Lit embeddings_v2/metadata.json pour enrichir les emails."""
@@ -105,9 +115,9 @@ def _envoyer_email_succes(context):
                 stats_html = f"""
                 <h4>📊 État de la base vectorielle</h4>
                 <table border="1" cellpadding="6" cellspacing="0">
-                  <tr><td><b>Chunks totaux</b></td><td>{meta.get('total_chunks', '?'):,}</td></tr>
-                  <tr><td><b>Dont tableaux</b></td><td>{stats.get('tables_count', '?'):,}</td></tr>
-                  <tr><td><b>Avec contexte LLM</b></td><td>{stats.get('with_context', '?'):,}</td></tr>
+                  <tr><td><b>Chunks totaux</b></td><td>{_fmt_nombre(meta.get('total_chunks'))}</td></tr>
+                  <tr><td><b>Dont tableaux</b></td><td>{_fmt_nombre(stats.get('tables_count'))}</td></tr>
+                  <tr><td><b>Avec contexte LLM</b></td><td>{_fmt_nombre(stats.get('with_context'))}</td></tr>
                   <tr><td><b>Date indexation</b></td><td>{meta.get('last_updated', '?')}</td></tr>
                   <tr><td><b>Modèle embedding</b></td><td>BGE-M3</td></tr>
                 </table>
@@ -250,12 +260,29 @@ def rag3_ingestion():
         nouveaux, modifies, supprimes = [], [], []
 
         for nom in pdfs_disque:
-            chemin     = str(DOCUMENTS_DIR / nom)
-            hash_actuel = _sha256(chemin)
+            chemin = DOCUMENTS_DIR / nom
             if nom not in manifest:
                 nouveaux.append(nom)
-            elif manifest[nom]["hash"] != hash_actuel:
+                continue
+
+            entry = manifest[nom]
+            stat  = chemin.stat()
+
+            # Pre-filtre taille + mtime : evite de lire le fichier entier si rien n'a change
+            taille_ok = entry.get("size")  == stat.st_size
+            mtime_ok  = entry.get("mtime") == stat.st_mtime
+
+            if taille_ok and mtime_ok:
+                continue  # fichier inchange avec tres haute probabilite
+
+            # Taille ou mtime different : recalcul du hash pour confirmer
+            hash_actuel = _sha256(str(chemin))
+            if entry["hash"] != hash_actuel:
                 modifies.append(nom)
+            else:
+                # Hash identique malgre les stats differentes : mettre a jour les stats
+                entry["size"]  = stat.st_size
+                entry["mtime"] = stat.st_mtime
 
         for nom in manifest:
             if nom not in pdfs_disque:
@@ -316,7 +343,7 @@ def rag3_ingestion():
         print(f"{supprime_count} fichier(s) chunk supprimé(s). "
               f"Manifest mis à jour : {len(changements['supprimes'])} retrait(s).")
 
-    @task(execution_timeout=None, retries=1, on_success_callback=_envoyer_email_succes)
+    @task(execution_timeout=timedelta(hours=4), retries=1, on_success_callback=_envoyer_email_succes)
     def chunker_pdfs(changements: dict) -> list:
         """
         Appelle RaptorRAGPipeline.process_document() sur chaque PDF
@@ -329,23 +356,25 @@ def rag3_ingestion():
             print("Aucun PDF à chunker.")
             return []
 
-        # Email de démarrage
-        try:
-            send_email(
-                to=EMAIL_DEST,
-                subject=f"[RAG3 🚀] Pipeline démarré — {len(pdfs_a_chunker)} PDF(s)",
-                html_content=f"""
-                <h3>🚀 Démarrage — RAG3 ANSTAT-CI</h3>
-                <table border="1" cellpadding="6" cellspacing="0">
-                  <tr><td><b>PDFs à traiter</b></td><td>{len(pdfs_a_chunker)}</td></tr>
-                  <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
-                </table>
-                <ul>{"".join(f"<li>{p}</li>" for p in pdfs_a_chunker)}</ul>
-                <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
-                """,
-            )
-        except Exception as exc:
-            print(f"[email] Email de démarrage non envoyé : {exc}")
+        # Email de demarrage (premiere tentative uniquement pour ne pas spammer en cas de retry)
+        from airflow.operators.python import get_current_context
+        if get_current_context()["task_instance"].try_number == 1:
+            try:
+                send_email(
+                    to=EMAIL_DEST,
+                    subject=f"[RAG3 🚀] Pipeline demarré — {len(pdfs_a_chunker)} PDF(s)",
+                    html_content=f"""
+                    <h3>🚀 Demarrage — RAG3 ANSTAT-CI</h3>
+                    <table border="1" cellpadding="6" cellspacing="0">
+                      <tr><td><b>PDFs a traiter</b></td><td>{len(pdfs_a_chunker)}</td></tr>
+                      <tr><td><b>Heure</b></td><td>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+                    </table>
+                    <ul>{"".join(f"<li>{p}</li>" for p in pdfs_a_chunker)}</ul>
+                    <p>🔗 <a href="http://localhost:8080">Voir les logs sur Airflow</a></p>
+                    """,
+                )
+            except Exception as exc:
+                print(f"[email] Email de demarrage non envoye : {exc}")
 
         if not CHUNK_SCRIPT.exists():
             raise FileNotFoundError(
@@ -399,13 +428,13 @@ def rag3_ingestion():
         print(f"\n{len(traites)}/{len(pdfs_a_chunker)} PDF(s) chunkés avec succès.")
         return traites
 
-    @task(execution_timeout=None, retries=1, on_success_callback=_envoyer_email_succes)
+    @task(execution_timeout=timedelta(hours=2), retries=1, on_success_callback=_envoyer_email_succes)
     def construire_index(pdfs_traites: list, changements: dict) -> str:
         """
         1. Appelle embedding_v2.build(incremental=True) :
            - retire les vecteurs orphelins (PDFs supprimés)
            - encode seulement les nouveaux chunks avec BGE-M3
-           - reconstruit FAISS IVFFlat + BM25Okapi
+           - reconstruit FAISS (FlatIP ou IVFFlat selon volume) + BM25Okapi
         2. Met à jour le manifest SHA-256 des PDFs indexés avec succès.
         """
         if not EMBED_SCRIPT.exists():
@@ -423,9 +452,12 @@ def rag3_ingestion():
         for nom in pdfs_traites:
             chemin = DOCUMENTS_DIR / nom
             if chemin.exists():
+                stat = chemin.stat()
                 manifest[nom] = {
                     "hash":       _sha256(str(chemin)),
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
+                    "size":       stat.st_size,
+                    "mtime":      stat.st_mtime,
                 }
         _sauvegarder_manifest(manifest)
 

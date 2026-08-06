@@ -11,7 +11,7 @@ INPUTS
   ~/rag_3/embeddings_v2/embeddings.npz   ← vecteurs existants (mode incrémental)
 
 OUTPUTS
-  ~/rag_3/embeddings_v2/faiss_index.bin   ← index vectoriel FAISS IVFFlat (dim=1024)
+  ~/rag_3/embeddings_v2/faiss_index.bin   ← index vectoriel FAISS (FlatIP < 10k chunks, IVFFlat sinon)
   ~/rag_3/embeddings_v2/bm25_index.pkl    ← index lexical BM25Okapi
   ~/rag_3/embeddings_v2/chunk_map.json    ← métadonnées de tous les chunks
   ~/rag_3/embeddings_v2/graph_index.json  ← infos géo/temporelles pour le graph bonus
@@ -64,6 +64,8 @@ CHUNKS_DIR       = Path.home() / "rag_3" / "chunks_output_v2"
 EMBEDDINGS_DIR   = Path.home() / "rag_3" / "embeddings_v2"
 EMBEDDING_MODEL  = str(Path.home() / "models" / "bge-m3")
 BATCH_SIZE       = 16   # réduit pour les machines sans GPU
+
+SEUIL_INDEX_EXACT = 10_000   # sous ce seuil : index exact (plus precis, aussi rapide)
 
 FAISS_INDEX_FILE = EMBEDDINGS_DIR / "faiss_index.bin"
 BM25_INDEX_FILE  = EMBEDDINGS_DIR / "bm25_index.pkl"
@@ -266,17 +268,44 @@ def encoder_nouveaux_chunks(
 # ── Construction des index ─────────────────────────────────────────────────────
 
 def construire_faiss(chunk_ids: list, all_vecs: np.ndarray) -> faiss.Index:
-    dim   = all_vecs.shape[1]
-    n     = len(chunk_ids)
-    nlist = min(512, max(4, n // 10))
+    """Construit un index FAISS adapte au volume.
 
+    Sous SEUIL_INDEX_EXACT : IndexFlatIP (exact, produit scalaire).
+    Au-dessus : IVFFlat (approximatif), avec au moins 39 points par cluster
+    pour eviter les avertissements FAISS et la quantification de mauvaise qualite.
+
+    Les vecteurs etant normalises L2, le produit scalaire est equivalent
+    a la similarite cosinus. system.py.py utilise le rang (RRF), pas la valeur
+    brute du score, donc le changement de metrique L2->IP est transparent.
+    """
+    dim = all_vecs.shape[1]
+    n   = len(chunk_ids)
+
+    if n < SEUIL_INDEX_EXACT:
+        print(f"   FAISS IndexFlatIP (exact) : {n} vecteurs, dim={dim}")
+        index = faiss.IndexFlatIP(dim)
+        index.add(all_vecs)
+        return index
+
+    nlist = min(512, max(4, n // 39))
     print(f"   FAISS IVFFlat : {n} vecteurs, {nlist} clusters, dim={dim}")
-    quantizer = faiss.IndexFlatL2(dim)
-    index     = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
+    quantizer = faiss.IndexFlatIP(dim)
+    index     = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
     index.train(all_vecs)
     index.add(all_vecs)
     index.nprobe = min(32, nlist)
     return index
+
+
+def _ecrire_atomique(chemin: Path, fonction_ecriture) -> None:
+    """Ecrit via un fichier temporaire puis renomme pour eviter les etats partiels."""
+    tmp = chemin.with_suffix(chemin.suffix + ".tmp")
+    try:
+        fonction_ecriture(tmp)
+        tmp.replace(chemin)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def construire_bm25(chunk_ids: list, chunk_map: dict) -> BM25Okapi:
@@ -297,28 +326,30 @@ def sauvegarder(
 ):
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Nettoyage des fichiers .tmp residuels d'une execution precedemment interrompue
+    for tmp in EMBEDDINGS_DIR.glob("*.tmp"):
+        tmp.unlink(missing_ok=True)
+
     text_hashes = np.array(
         [_hash_texte(chunk_map[cid]["enriched_text"]) for cid in chunk_ids],
         dtype=object,
     )
-    np.savez(
-        EMBEDDINGS_FILE,
-        chunk_ids=np.array(chunk_ids, dtype=object),
-        embeddings=all_vecs,
-        text_hashes=text_hashes,
-    )
 
-    faiss.write_index(faiss_index, str(FAISS_INDEX_FILE))
+    def _sauver_npz(tmp):
+        np.savez(
+            tmp,
+            chunk_ids=np.array(chunk_ids, dtype=object),
+            embeddings=all_vecs,
+            text_hashes=text_hashes,
+        )
 
-    with open(BM25_INDEX_FILE, "wb") as f:
-        pickle.dump(bm25_index, f)
-
-    with open(CHUNK_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(chunk_map, f, ensure_ascii=False)
+    _ecrire_atomique(EMBEDDINGS_FILE,  _sauver_npz)
+    _ecrire_atomique(FAISS_INDEX_FILE, lambda p: faiss.write_index(faiss_index, str(p)))
+    _ecrire_atomique(BM25_INDEX_FILE,  lambda p: pickle.dump(bm25_index, open(p, "wb")))
+    _ecrire_atomique(CHUNK_MAP_FILE,   lambda p: json.dump(chunk_map, open(p, "w", encoding="utf-8"), ensure_ascii=False))
 
     graph_index = {"doc_relations": {}, "chunk_meta": graph_meta}
-    with open(GRAPH_INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(graph_index, f, ensure_ascii=False)
+    _ecrire_atomique(GRAPH_INDEX_FILE, lambda p: json.dump(graph_index, open(p, "w", encoding="utf-8"), ensure_ascii=False))
 
     tables_count = sum(1 for c in chunk_map.values() if c.get("is_table"))
     with_context = sum(1 for c in chunk_map.values() if c.get("context_desc"))
@@ -399,9 +430,18 @@ def build(incremental: bool = True):
         else existing_vecs
     )
 
-    # Réordonner selon chunk_map pour cohérence
-    id_to_idx    = {cid: i for i, cid in enumerate(all_ids)}
-    ordered_ids  = list(chunk_map.keys())
+    # Reordonner selon chunk_map pour coherence
+    id_to_idx   = {cid: i for i, cid in enumerate(all_ids)}
+    ordered_ids = list(chunk_map.keys())
+
+    manquants = [cid for cid in ordered_ids if cid not in id_to_idx]
+    if manquants:
+        raise RuntimeError(
+            f"{len(manquants)} chunk(s) sans vecteur correspondant "
+            f"(exemples : {manquants[:5]}). "
+            "Relancez avec --full pour forcer un reencodage complet."
+        )
+
     ordered_vecs = np.stack([all_vecs[id_to_idx[cid]] for cid in ordered_ids])
 
     # 5. Construction des index FAISS + BM25
