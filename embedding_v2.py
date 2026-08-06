@@ -38,6 +38,7 @@ USAGE
 """
 
 import argparse
+import hashlib
 import json
 import pickle
 import re
@@ -95,6 +96,11 @@ SERIES_MOTS = {
 
 
 # ── Utilitaires ────────────────────────────────────────────────────────────────
+
+def _hash_texte(texte: str) -> str:
+    """Hash court du texte encode, sert a invalider le cache d'embeddings."""
+    return hashlib.sha256(texte.encode("utf-8")).hexdigest()[:16]
+
 
 def tokenize_fr(text: str) -> list:
     text = text.lower()
@@ -206,32 +212,36 @@ def encoder(model, model_type: str, texts: list) -> np.ndarray:
     return embs / np.maximum(norms, 1e-9)
 
 
-def charger_embeddings_existants() -> tuple[list, np.ndarray]:
-    """Charge embeddings.npz si disponible."""
+def charger_embeddings_existants() -> tuple[list, np.ndarray, dict]:
+    """Charge embeddings.npz si disponible. Retourne (ids, vecteurs, hashes_texte).
+
+    hashes_texte est vide si le .npz est ancien (pas de cle text_hashes),
+    ce qui declenche un reencodage complet au premier passage : comportement voulu.
+    """
     if not EMBEDDINGS_FILE.exists():
-        return [], np.empty((0, 1024), dtype=np.float32)
+        return [], np.empty((0, 1024), dtype=np.float32), {}
     data    = np.load(EMBEDDINGS_FILE, allow_pickle=True)
     ids     = list(data["chunk_ids"])
     vectors = data["embeddings"].astype(np.float32)
-    print(f"   {len(ids)} embeddings existants chargés")
-    return ids, vectors
+    if "text_hashes" in data:
+        hashes = {cid: h for cid, h in zip(ids, data["text_hashes"])}
+    else:
+        hashes = {}
+    print(f"   {len(ids)} embeddings existants charges")
+    return ids, vectors, hashes
 
 
 def encoder_nouveaux_chunks(
     model, model_type: str,
-    chunk_map: dict,
-    existing_ids: list,
+    a_encoder: list,
 ) -> tuple[list, np.ndarray]:
-    """Encode uniquement les chunks absents de embeddings.npz."""
-    existing_set = set(existing_ids)
-    a_encoder = [
-        (cid, chunk_map[cid]["enriched_text"])
-        for cid in chunk_map
-        if cid not in existing_set
-    ]
+    """Encode la liste de (chunk_id, texte) fournie par build().
 
+    La liste est pre-calculee dans build() pour eviter de recalculer set(existing_ids)
+    a chaque iteration (N2) et pour integrer l'invalidation par hash (N1).
+    """
     if not a_encoder:
-        print("   Aucun nouveau chunk à encoder")
+        print("   Aucun chunk a encoder")
         return [], np.empty((0, 1024), dtype=np.float32)
 
     ids   = [cid  for cid, _    in a_encoder]
@@ -245,10 +255,11 @@ def encoder_nouveaux_chunks(
         batch = texts[i:i + BATCH_SIZE]
         all_vecs.append(encoder(model, model_type, batch))
         done = min(i + BATCH_SIZE, n)
-        print(f"   {done}/{n} ({done * 100 // n}%)", end="\r", flush=True)
+        if (i // BATCH_SIZE) % 20 == 0 or done == n:
+            print(f"   {done}/{n} ({done * 100 // n}%)", flush=True)
 
     vecs = np.vstack(all_vecs)
-    print(f"\n   Encodés en {time.time() - t0:.1f}s")
+    print(f"   Encodes en {time.time() - t0:.1f}s")
     return ids, vecs
 
 
@@ -286,10 +297,15 @@ def sauvegarder(
 ):
     EMBEDDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
+    text_hashes = np.array(
+        [_hash_texte(chunk_map[cid]["enriched_text"]) for cid in chunk_ids],
+        dtype=object,
+    )
     np.savez(
         EMBEDDINGS_FILE,
         chunk_ids=np.array(chunk_ids, dtype=object),
         embeddings=all_vecs,
+        text_hashes=text_hashes,
     )
 
     faiss.write_index(faiss_index, str(FAISS_INDEX_FILE))
@@ -340,25 +356,39 @@ def build(incremental: bool = True):
 
     # 2. Chargement embeddings existants
     print("\n[2/5] Chargement embeddings existants...")
-    existing_ids, existing_vecs = charger_embeddings_existants() if incremental else ([], np.empty((0, 1024), dtype=np.float32))
+    if incremental:
+        existing_ids, existing_vecs, existing_hashes = charger_embeddings_existants()
+    else:
+        existing_ids, existing_vecs, existing_hashes = [], np.empty((0, 1024), dtype=np.float32), {}
 
-    # 3. Suppression des vecteurs orphelins (chunks supprimés)
-    valid_existing = [(i, cid) for i, cid in enumerate(existing_ids) if cid in chunk_map]
-    if len(valid_existing) < len(existing_ids):
-        n_orphans = len(existing_ids) - len(valid_existing)
-        print(f"   {n_orphans} vecteurs orphelins supprimés")
-        keep_idx     = [i for i, _ in valid_existing]
-        existing_ids = [cid for _, cid in valid_existing]
+    # Suppression des vecteurs invalides : orphelins (chunk supprime) ou texte modifie.
+    # Si existing_hashes est vide (ancien .npz sans text_hashes), tous les chunks
+    # echouent la verification et sont reencode : comportement de migration voulu.
+    valid_existing = [
+        (i, cid) for i, cid in enumerate(existing_ids)
+        if cid in chunk_map
+        and existing_hashes.get(cid) == _hash_texte(chunk_map[cid]["enriched_text"])
+    ]
+    n_invalides = len(existing_ids) - len(valid_existing)
+    if n_invalides > 0:
+        print(f"   {n_invalides} vecteur(s) invalide(s) retires (orphelins ou texte modifie)")
+        keep_idx      = [i for i, _ in valid_existing]
+        existing_ids  = [cid for _, cid in valid_existing]
         existing_vecs = existing_vecs[keep_idx] if keep_idx else np.empty((0, 1024), dtype=np.float32)
 
-    # 3. Encodage des nouveaux chunks (modèle chargé seulement si nécessaire)
+    # 3. Encodage des chunks nouveaux ou modifies (modele charge seulement si necessaire)
     print("\n[3/5] Encodage des nouveaux chunks...")
-    a_encoder = [cid for cid in chunk_map if cid not in set(existing_ids)]
+    existing_set = set(existing_ids)
+    a_encoder = [
+        (cid, chunk_map[cid]["enriched_text"])
+        for cid in chunk_map
+        if cid not in existing_set
+    ]
     if a_encoder:
         model, model_type = charger_modele()
-        new_ids, new_vecs = encoder_nouveaux_chunks(model, model_type, chunk_map, existing_ids)
+        new_ids, new_vecs = encoder_nouveaux_chunks(model, model_type, a_encoder)
     else:
-        print("   Aucun nouveau chunk, modèle BGE-M3 non chargé.")
+        print("   Aucun chunk a encoder, modele BGE-M3 non charge.")
         new_ids, new_vecs = [], np.empty((0, 1024), dtype=np.float32)
 
     # 4. Fusion
