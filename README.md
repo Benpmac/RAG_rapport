@@ -1,4 +1,4 @@
-# RAG_3 — Système de Question-Réponse ANSTAT-CI
+# RAG_3 
 
 Système de recherche et de question-réponse intelligent sur les rapports statistiques officiels de Côte d'Ivoire (ANSTAT-CI). Pose une question en français, le système cherche dans des dizaines de rapports PDF et répond avec les données précises et les sources.
 
