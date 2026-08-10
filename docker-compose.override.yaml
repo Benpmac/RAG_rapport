@@ -1,0 +1,28 @@
+version: "3.8"
+
+# Override du docker-compose officiel Airflow pour RAG_3 ANSTAT-CI
+# Usage : docker compose -f docker-compose.yaml -f docker-compose.override.yaml up
+
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    RAG3_DIR: /opt/rag3/data
+    EMBEDDING_MODEL: /opt/rag3/models/bge-m3
+    BATCH_SIZE: ${BATCH_SIZE:-16}
+    HF_HOME: /opt/rag3/models/hf_cache
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./rag3_data:/opt/rag3/data
+    - ${MODELS_DIR:-./models}:/opt/rag3/models
+
+services:
+  airflow-webserver:
+    <<: *airflow-common
+  airflow-scheduler:
+    <<: *airflow-common
+  airflow-worker:
+    <<: *airflow-common
+  airflow-triggerer:
+    <<: *airflow-common
