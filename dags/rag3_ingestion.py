@@ -8,10 +8,10 @@ RÔLE
   ~/rag_3/documents/, re-chunke et réindexe uniquement ce qui a changé.
 
 INPUTS
-  ~/rag_3/documents/*.pdf    ← PDFs à indexer (dépôt manuel)
-  ~/rag_3/manifest.json      ← hashes SHA-256 des PDFs déjà indexés
-  ~/rag_3/CHUNK.py.py        ← pipeline de chunking RAPTOR (importé dynamiquement)
-  ~/rag_3/embedding_v2.py    ← pipeline d'indexation FAISS+BM25 (importé dynamiquement)
+  $RAG3_DIR/documents/*.pdf    ← PDFs à indexer (dépôt manuel)
+  $RAG3_DIR/manifest.json      ← hashes SHA-256 des PDFs déjà indexés
+  $RAG3_DIR/chunk_pipeline.py  ← pipeline de chunking RAPTOR (importé dynamiquement)
+  $RAG3_DIR/embedding_v2.py    ← pipeline d'indexation FAISS+BM25 (importé dynamiquement)
 
 OUTPUTS
   ~/rag_3/chunks_output_v2/*_chunks.json  ← chunks JSON par PDF (via CHUNK.py.py)
@@ -48,9 +48,9 @@ PIPELINE
 """
 
 import hashlib
-import importlib.util
 import json
 import os
+import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,13 +61,10 @@ from airflow.models import Variable
 from airflow.utils.email import send_email
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-RAG3_DIR       = Path.home() / "rag_3"
+RAG3_DIR       = Path(os.environ.get("RAG3_DIR", str(Path.home() / "rag_3" / "rag3_data")))
 DOCUMENTS_DIR  = RAG3_DIR / "documents"
 CHUNKS_DIR     = RAG3_DIR / "chunks_output_v2"
 MANIFEST_PATH  = RAG3_DIR / "manifest.json"
-
-CHUNK_SCRIPT   = RAG3_DIR / "CHUNK.py.py"
-EMBED_SCRIPT   = RAG3_DIR / "embedding_v2.py"
 
 # LLM pour l'enrichissement contextuel RAPTOR (optionnel)
 # Gere via Airflow UI : Admin > Variables > rag3_vllm_url
@@ -376,10 +373,11 @@ def rag3_ingestion():
             except Exception as exc:
                 print(f"[email] Email de demarrage non envoye : {exc}")
 
-        if not CHUNK_SCRIPT.exists():
+        chunk_module_path = RAG3_DIR / "chunk_pipeline.py"
+        if not chunk_module_path.exists():
             raise FileNotFoundError(
-                f"Script CHUNK.py.py introuvable : {CHUNK_SCRIPT}\n"
-                "Vérifiez que CHUNK.py.py est bien présent dans ~/rag_3/."
+                f"chunk_pipeline.py introuvable : {chunk_module_path}\n"
+                "Vérifiez que chunk_pipeline.py est bien présent dans RAG3_DIR."
             )
 
         # Vérification accessibilité vLLM
@@ -388,13 +386,9 @@ def rag3_ingestion():
             print("⚠️  vLLM inaccessible — chunking sans enrichissement LLM (use_llm_context=False)")
             use_llm = False
 
-        # Import dynamique — le nom de fichier contient des points
-        spec      = importlib.util.spec_from_file_location("chunk_pipeline", str(CHUNK_SCRIPT))
-        chunk_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(chunk_mod)
-
-        PipelineConfig    = chunk_mod.PipelineConfig
-        RaptorRAGPipeline = chunk_mod.RaptorRAGPipeline
+        if str(RAG3_DIR) not in sys.path:
+            sys.path.insert(0, str(RAG3_DIR))
+        from chunk_pipeline import PipelineConfig, RaptorRAGPipeline
 
         config = PipelineConfig(
             documents_dir   = DOCUMENTS_DIR,
@@ -437,15 +431,14 @@ def rag3_ingestion():
            - reconstruit FAISS (FlatIP ou IVFFlat selon volume) + BM25Okapi
         2. Met à jour le manifest SHA-256 des PDFs indexés avec succès.
         """
-        if not EMBED_SCRIPT.exists():
-            raise FileNotFoundError(f"embedding_v2.py introuvable : {EMBED_SCRIPT}")
+        embed_module_path = RAG3_DIR / "embedding_v2.py"
+        if not embed_module_path.exists():
+            raise FileNotFoundError(f"embedding_v2.py introuvable : {embed_module_path}")
 
-        # Import dynamique
-        spec    = importlib.util.spec_from_file_location("embedding_v2", str(EMBED_SCRIPT))
-        emb_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(emb_mod)
-
-        emb_mod.build(incremental=True)
+        if str(RAG3_DIR) not in sys.path:
+            sys.path.insert(0, str(RAG3_DIR))
+        import embedding_v2
+        embedding_v2.build(incremental=True)
 
         # Mise à jour du manifest APRÈS indexation réussie
         manifest = _charger_manifest()

@@ -1,7 +1,10 @@
 # ── Données volumineuses (non versionnées) ─────────────────────────────────────
-documents/               # PDFs sources
-chunks_output_v2/        # chunks JSON générés (reconstruits par CHUNK.py.py)
-embeddings_v2/           # index FAISS, BM25, vecteurs (reconstruits par embedding_v2.py)
+documents/
+chunks_output_v2/
+embeddings_v2/
+rag3_data/documents/
+rag3_data/chunks_output_v2/
+rag3_data/embeddings_v2/
 
 # ── Modèles ────────────────────────────────────────────────────────────────────
 models/

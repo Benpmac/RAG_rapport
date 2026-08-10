@@ -40,6 +40,7 @@ USAGE
 import argparse
 import hashlib
 import json
+import os
 import pickle
 import re
 import time
@@ -60,10 +61,11 @@ except ImportError:
     from sentence_transformers import SentenceTransformer
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-CHUNKS_DIR       = Path.home() / "rag_3" / "chunks_output_v2"
-EMBEDDINGS_DIR   = Path.home() / "rag_3" / "embeddings_v2"
-EMBEDDING_MODEL  = str(Path.home() / "models" / "bge-m3")
-BATCH_SIZE       = 16   # réduit pour les machines sans GPU
+RAG3_DIR        = Path(os.environ.get("RAG3_DIR", str(Path.home() / "rag_3" / "rag3_data")))
+CHUNKS_DIR      = RAG3_DIR / "chunks_output_v2"
+EMBEDDINGS_DIR  = RAG3_DIR / "embeddings_v2"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", str(Path.home() / "models" / "bge-m3"))
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE", "16"))
 
 SEUIL_INDEX_EXACT = 10_000   # sous ce seuil : index exact (plus precis, aussi rapide)
 
